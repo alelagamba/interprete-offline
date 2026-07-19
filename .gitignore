@@ -1,0 +1,25 @@
+# Build
+.gradle/
+build/
+*/build/
+*.iml
+.idea/
+.vscode/
+local.properties
+
+# Native build artifacts
+.cxx/
+.externalNativeBuild/
+
+# Signing
+*.jks
+*.keystore
+*.p12
+*.pem
+
+# Python virtualenvs
+.venv/
+venv/
+
+# macOS
+.DS_Store

@@ -1,0 +1,57 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate project
+        run: ./gradlew :app:assembleDebug
+
+      - name: Decode signing keystore
+        run: echo "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" | base64 -d > /tmp/release.keystore
+
+      - name: Build signed interpreter APK
+        run: |
+          ./gradlew \
+            :app:assembleRelease \
+            -PVERSION_NAME=${{ steps.version.outputs.VERSION }} \
+            -PVERSION_CODE=${{ github.run_number }}
+        env:
+          SIGNING_KEYSTORE: /tmp/release.keystore
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            app/build/outputs/apk/release/interprete-offline-release.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
