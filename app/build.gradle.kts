@@ -35,10 +35,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-            )
+            // sherpa-onnx reads Kotlin/Java config fields from JNI. R8
+            // obfuscation can rename those fields and crash native TTS setup.
+            isMinifyEnabled = false
             if (System.getenv("SIGNING_KEYSTORE") != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
