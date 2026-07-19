@@ -3,6 +3,7 @@ package com.translator.app
 import android.Manifest
 import android.animation.ValueAnimator
 import android.app.AlertDialog
+import android.content.res.Configuration
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -122,8 +123,13 @@ class MainActivity : ComponentActivity() {
     private var ttsEnabled = true
     private var extraLanguagesEnabled = false
     private var textScale = 1.0f
+    private var simultaneousMode = false
     private var selectedSourceIndex = 1
     private var selectedTargetIndex = 0
+    private var speechModelDir: String? = null
+    private var liveTranslateSerial = 0
+    private var lastLiveTranslationRequest = ""
+    private var lastLiveTranslationAt = 0L
 
     private val translators = mutableMapOf<TranslationKey, Translator>()
     private val readyTranslationKeys = mutableSetOf<TranslationKey>()
@@ -160,6 +166,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var waveform: LiveWaveformView
     private lateinit var settingsPanel: ScrollView
     private lateinit var settingsContent: LinearLayout
+    private lateinit var modeButton: TextView
 
     companion object {
         private const val TAG = "Translator"
@@ -169,6 +176,7 @@ class MainActivity : ComponentActivity() {
         private const val PREF_USE_PIPER = "use-piper"
         private const val PREF_EXTRA_LANGUAGES = "extra-languages"
         private const val PREF_TEXT_SCALE = "text-scale"
+        private const val PREF_SIMULTANEOUS_MODE = "simultaneous-mode"
         private const val MIC_PERMISSION = 1
 
         private val STT_MODEL = SttModel.PARAKEET
@@ -234,6 +242,7 @@ class MainActivity : ComponentActivity() {
         usePiper = prefs.getBoolean(PREF_USE_PIPER, true)
         extraLanguagesEnabled = prefs.getBoolean(PREF_EXTRA_LANGUAGES, false)
         textScale = prefs.getFloat(PREF_TEXT_SCALE, 1.0f).coerceIn(0.9f, 1.25f)
+        simultaneousMode = prefs.getBoolean(PREF_SIMULTANEOUS_MODE, false)
         languageIdentifier = LanguageIdentification.getClient()
         piperTts = PiperTts(applicationContext)
         buildUI()
@@ -382,8 +391,11 @@ class MainActivity : ComponentActivity() {
 
         root.addView(header())
 
+        val cardsHorizontal = simultaneousMode &&
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
         val cards = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = if (cardsHorizontal) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             setPadding(dp(18), dp(6), dp(18), dp(4))
             clipChildren = false
             clipToPadding = false
@@ -406,8 +418,12 @@ class MainActivity : ComponentActivity() {
             background = roundedColor(BLACK_BTN, dpF(28f))
             elevation = dpF(8f)
             layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                setMargins(0, dp(-24), 0, dp(-24))
+                gravity = if (cardsHorizontal) Gravity.CENTER_VERTICAL else Gravity.CENTER_HORIZONTAL
+                if (cardsHorizontal) {
+                    setMargins(dp(-16), 0, dp(-16), 0)
+                } else {
+                    setMargins(0, dp(-24), 0, dp(-24))
+                }
             }
             setOnClickListener { swapLanguages() }
         }
@@ -444,6 +460,7 @@ class MainActivity : ComponentActivity() {
 
         setContentView(rootFrame)
         updateLanguageUi()
+        updateModeButton()
         updateButtonStates()
     }
 
@@ -517,6 +534,15 @@ class MainActivity : ComponentActivity() {
 
         // ------------------------------------------------ conversation card
         val convCard = settingsCard("Conversazione")
+        convCard.addView(switchRow(
+            "Simultanea beta",
+            "Mostra testo e traduzione mentre continui a parlare. Usa la direzione selezionata e non legge ad alta voce.",
+            simultaneousMode,
+        ) { checked ->
+            setSimultaneousMode(checked)
+            rebuildSettings()
+        })
+        convCard.addView(settingsDivider())
         convCard.addView(switchRow(
             "Conversazione continua",
             "Dopo ogni frase l'app torna in ascolto da sola. Se disattivata, premi il microfono per ogni frase.",
@@ -962,16 +988,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun translationCard(isSource: Boolean): LinearLayout {
+        val horizontalCards = simultaneousMode &&
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedColor(CARD, dpF(30f))
             elevation = dpF(4f)
             setPadding(dp(18), dp(16), dp(18), dp(16))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f,
-            )
+            layoutParams = if (horizontalCards) {
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+            } else {
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            }
         }
 
         val controls = LinearLayout(this).apply {
@@ -1167,6 +1195,21 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(20), dp(10), dp(20), dp(14))
         }
+
+        modeButton = TextView(this).apply {
+            textSize = 13f
+            gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { setMargins(0, 0, 0, dp(8)) }
+            setOnClickListener {
+                if (!conversationActive) setSimultaneousMode(!simultaneousMode)
+            }
+        }
+        panel.addView(modeButton)
 
         waveform = LiveWaveformView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -1515,9 +1558,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initPipeline(modelDir: String) {
+        speechModelDir = modelDir
         lifecycleScope.launch {
             try {
                 setStatus("Preparo modello ascolto...")
+                withContext(Dispatchers.IO) {
+                    runCatching { pipeline?.close() }
+                }
+                pipeline = null
+                updateButtonStates()
                 val config = SpeechConfig(
                     modelDir = modelDir,
                     pipelineMode = PipelineMode.TRANSCRIBE_ONLY,
@@ -1525,7 +1574,8 @@ class MainActivity : ComponentActivity() {
                     sttModel = STT_MODEL,
                     ttsModel = PIPELINE_TTS_MODEL,
                     precision = ModelPrecision.INT8,
-                    emitPartialTranscriptions = false,
+                    emitPartialTranscriptions = simultaneousMode,
+                    partialTranscriptionInterval = if (simultaneousMode) 0.45f else 0.5f,
                     endOfSpeechSilenceSec = 0.9f,
                 )
 
@@ -1538,8 +1588,17 @@ class MainActivity : ComponentActivity() {
                     p.events.collect { event ->
                         when (event) {
                             is SpeechEvent.SpeechStarted -> setStatus("Sto ascoltando...")
-                            is SpeechEvent.SpeechEnded -> setStatus("Sto trascrivendo...")
-                            is SpeechEvent.TranscriptionCompleted -> handleTranscription(event.text)
+                            is SpeechEvent.SpeechEnded -> {
+                                if (simultaneousMode) setStatus("In ascolto live...") else setStatus("Sto trascrivendo...")
+                            }
+                            is SpeechEvent.PartialTranscription -> handlePartialTranscription(event.text)
+                            is SpeechEvent.TranscriptionCompleted -> {
+                                if (simultaneousMode) {
+                                    handlePartialTranscription(event.text, force = true)
+                                } else {
+                                    handleTranscription(event.text)
+                                }
+                            }
                             is SpeechEvent.Error -> {
                                 Log.e(TAG, "Pipeline error: ${event.message}")
                                 setStatus("Errore: ${event.message}")
@@ -1591,6 +1650,9 @@ class MainActivity : ComponentActivity() {
         conversationActive = true
         processing = false
         micMuted = false
+        liveTranslateSerial = 0
+        lastLiveTranslationRequest = ""
+        lastLiveTranslationAt = 0L
         hideKeyboard()
         showPlaceholders()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -1601,12 +1663,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun listeningStatus(): String =
-        "In ascolto: parla in ${selectedSource().promptName} o in ${selectedTarget().promptName}"
+        if (simultaneousMode) {
+            "Simultanea: ${selectedSource().name} -> ${selectedTarget().name}"
+        } else {
+            "In ascolto: parla in ${selectedSource().promptName} o in ${selectedTarget().promptName}"
+        }
 
     private fun stopConversation() {
         conversationActive = false
         processing = false
         micMuted = false
+        liveTranslateSerial++
+        lastLiveTranslationRequest = ""
+        lastLiveTranslationAt = 0L
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         micButton.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         updateButtonStates()
@@ -1712,6 +1781,47 @@ class MainActivity : ComponentActivity() {
 
         detectDirection(text) { source, target -> runExchange(text, source, target) }
     }
+
+    private fun handlePartialTranscription(rawText: String, force: Boolean = false) {
+        if (!simultaneousMode || !conversationActive) return
+        val text = rawText.trim().replace(Regex("\\s+"), " ")
+        if (text.isBlank()) return
+
+        sourceText.setText(text)
+        sourceText.setSelection(sourceText.text.length)
+
+        val now = System.currentTimeMillis()
+        val enoughTime = now - lastLiveTranslationAt > 1200L
+        val enoughGrowth = wordCount(text) >= wordCount(lastLiveTranslationRequest) + 4
+        val sentenceBoundary = text.lastOrNull() in listOf('.', '?', '!', ':', ';')
+        if (!force && !sentenceBoundary && (!enoughTime || !enoughGrowth)) return
+        if (text == lastLiveTranslationRequest) return
+
+        val source = selectedSource()
+        val target = selectedTarget()
+        if (!isTranslationReady(source, target)) return
+
+        lastLiveTranslationRequest = text
+        lastLiveTranslationAt = now
+        val serial = ++liveTranslateSerial
+        setStatus("Traduco live...")
+
+        translatorFor(source, target).translate(text)
+            .addOnSuccessListener { translated ->
+                lifecycleScope.launch(Dispatchers.Main) {
+                    if (!simultaneousMode || !conversationActive || serial != liveTranslateSerial) return@launch
+                    setCardText(targetText, translated)
+                    setStatus(listeningStatus())
+                }
+            }
+            .addOnFailureListener { e ->
+                Log.w(TAG, "Live translation failed", e)
+                if (serial == liveTranslateSerial) setStatus("Errore traduzione live")
+            }
+    }
+
+    private fun wordCount(text: String): Int =
+        text.trim().split(Regex("\\s+")).count { it.isNotBlank() }
 
     /**
      * Picks the translation direction by scoring the text against the two
@@ -2007,6 +2117,32 @@ class MainActivity : ComponentActivity() {
         if (::targetText.isInitialized) targetText.textSize = 23f * textScale
     }
 
+    private fun setSimultaneousMode(enabled: Boolean) {
+        if (conversationActive) return
+        if (simultaneousMode == enabled) return
+        simultaneousMode = enabled
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_SIMULTANEOUS_MODE, enabled)
+            .apply()
+        stopSpeech()
+        showPlaceholders()
+        updateModeButton()
+        updateButtonStates()
+        speechModelDir?.let { dir ->
+            initPipeline(dir)
+        }
+        setStatus(if (enabled) "Modalità simultanea pronta" else "Modalità a turni pronta")
+    }
+
+    private fun updateModeButton() {
+        if (!::modeButton.isInitialized) return
+        modeButton.text = if (simultaneousMode) "Simultanea beta" else "Modalità a turni"
+        modeButton.setTextColor(Color.parseColor(if (simultaneousMode) "#FFFFFF" else TEXT_PRIMARY))
+        modeButton.background = roundedColor(if (simultaneousMode) BLACK_BTN else CARD, dpF(18f))
+        modeButton.elevation = dpF(2f)
+    }
+
     private fun updateButtonStates() {
         val ready = pipeline != null && areSelectedTranslationModelsReady()
         val active = conversationActive
@@ -2017,6 +2153,10 @@ class MainActivity : ComponentActivity() {
         listOf(sourcePill, targetPill, swapButton, keyboardButton, cameraButton, clearButton).forEach {
             it.isEnabled = !active
             it.alpha = if (active) 0.45f else 1.0f
+        }
+        if (::modeButton.isInitialized) {
+            modeButton.isEnabled = !active
+            modeButton.alpha = if (active) 0.55f else 1.0f
         }
     }
 
