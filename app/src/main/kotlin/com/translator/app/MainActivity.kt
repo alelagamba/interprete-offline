@@ -121,6 +121,7 @@ class MainActivity : ComponentActivity() {
     private var systemTtsReady = false
     private var ttsEnabled = true
     private var extraLanguagesEnabled = false
+    private var textScale = 1.0f
     private var selectedSourceIndex = 1
     private var selectedTargetIndex = 0
 
@@ -167,6 +168,7 @@ class MainActivity : ComponentActivity() {
         private const val PREF_CONTINUOUS = "continuous-mode"
         private const val PREF_USE_PIPER = "use-piper"
         private const val PREF_EXTRA_LANGUAGES = "extra-languages"
+        private const val PREF_TEXT_SCALE = "text-scale"
         private const val MIC_PERMISSION = 1
 
         private val STT_MODEL = SttModel.PARAKEET
@@ -231,6 +233,7 @@ class MainActivity : ComponentActivity() {
         continuousMode = prefs.getBoolean(PREF_CONTINUOUS, true)
         usePiper = prefs.getBoolean(PREF_USE_PIPER, true)
         extraLanguagesEnabled = prefs.getBoolean(PREF_EXTRA_LANGUAGES, false)
+        textScale = prefs.getFloat(PREF_TEXT_SCALE, 1.0f).coerceIn(0.9f, 1.25f)
         languageIdentifier = LanguageIdentification.getClient()
         piperTts = PiperTts(applicationContext)
         buildUI()
@@ -254,6 +257,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        stopSpeech()
         if (conversationActive) {
             stopConversation()
         } else {
@@ -523,6 +527,34 @@ class MainActivity : ComponentActivity() {
         })
         settingsContent.addView(convCard)
 
+        // ---------------------------------------------------------- text card
+        val textCard = settingsCard("Testo")
+        textCard.addView(TextView(this).apply {
+            text = "Dimensione testo traduzioni"
+            textSize = 15f
+            setTextColor(Color.parseColor(TEXT_PRIMARY))
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        })
+        textCard.addView(TextView(this).apply {
+            text = "Regola solo i testi principali: originale e traduzione."
+            textSize = 12f
+            setTextColor(Color.parseColor(TEXT_SECONDARY))
+            setPadding(0, dp(4), 0, dp(12))
+        })
+        val scaleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        listOf(
+            "Piccolo" to 0.9f,
+            "Normale" to 1.0f,
+            "Grande" to 1.18f,
+        ).forEach { (label, scale) ->
+            scaleRow.addView(textScaleButton(label, scale))
+        }
+        textCard.addView(scaleRow)
+        settingsContent.addView(textCard)
+
         // ------------------------------------------------------- voice card
         val voiceCard = settingsCard("Voce")
         voiceCard.addView(switchRow(
@@ -632,6 +664,24 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(1),
             ).apply { setMargins(0, dp(12), 0, dp(12)) }
+        }
+
+    private fun textScaleButton(label: String, scale: Float): TextView =
+        TextView(this).apply {
+            val selected = kotlin.math.abs(textScale - scale) < 0.03f
+            text = label
+            textSize = 13f
+            gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(Color.parseColor(if (selected) "#FFFFFF" else TEXT_PRIMARY))
+            background = roundedColor(if (selected) BLACK_BTN else PILL, dpF(18f))
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(4), 0, dp(4), 0) }
+            setOnClickListener {
+                setTextScale(scale)
+                rebuildSettings()
+            }
         }
 
     private fun switchRow(
@@ -992,6 +1042,9 @@ class MainActivity : ComponentActivity() {
             controls.addView(iconCircle(SpeakerIconView(this)) {
                 speakIfReal(targetText.text.toString(), TGT_PLACEHOLDER, selectedTarget())
             })
+            controls.addView(iconCircle(StopIconView(this)) {
+                stopSpeech(interruptedByUser = true)
+            })
         }
         card.addView(controls)
 
@@ -1041,7 +1094,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         textView.apply {
-            textSize = 23f
+            textSize = 23f * textScale
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             gravity = Gravity.CENTER
             setLineSpacing(dpF(3f), 1.02f)
@@ -1740,6 +1793,7 @@ class MainActivity : ComponentActivity() {
     /** Speaks the translation; returns false when playback could not start. */
     private fun speakInConversation(text: String, language: LanguageOption): Boolean {
         if (!ttsEnabled) return false
+        stopSpeech()
 
         val piper = piperTts
         if (usePiper && piper != null && piper.isVoiceReady(language.ttsCode)) {
@@ -1813,7 +1867,21 @@ class MainActivity : ComponentActivity() {
         speak(text, language)
     }
 
+    private fun stopSpeech(interruptedByUser: Boolean = false) {
+        piperTts?.stop()
+        systemTts?.stop()
+        if (interruptedByUser) {
+            micButton.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            if (conversationActive && processing) {
+                finishExchange()
+            } else if (!conversationActive) {
+                setStatus("Audio interrotto")
+            }
+        }
+    }
+
     private fun speak(text: String, language: LanguageOption) {
+        stopSpeech()
         val piper = piperTts
         if (usePiper && piper != null && piper.isVoiceReady(language.ttsCode)) {
             lifecycleScope.launch(Dispatchers.IO) { piper.speak(text, language.ttsCode) }
@@ -1921,7 +1989,22 @@ class MainActivity : ComponentActivity() {
             .edit()
             .putBoolean(PREF_TTS_ENABLED, enabled)
             .apply()
+        if (!enabled) stopSpeech(interruptedByUser = true)
         if (enabled) ensureVoicesForSelection()
+    }
+
+    private fun setTextScale(scale: Float) {
+        textScale = scale.coerceIn(0.9f, 1.25f)
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putFloat(PREF_TEXT_SCALE, textScale)
+            .apply()
+        applyTextScale()
+    }
+
+    private fun applyTextScale() {
+        if (::sourceText.isInitialized) sourceText.textSize = 23f * textScale
+        if (::targetText.isInitialized) targetText.textSize = 23f * textScale
     }
 
     private fun updateButtonStates() {
@@ -2284,6 +2367,25 @@ class MainActivity : ComponentActivity() {
             canvas.drawArc(arc1, -55f, 110f, false, paint)
             val arc2 = RectF(w * 0.40f, h * 0.24f, w * 0.88f, h * 0.76f)
             canvas.drawArc(arc2, -55f, 110f, false, paint)
+        }
+    }
+
+    /** Stop playback icon. */
+    private class StopIconView(context: android.content.Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#3C434D")
+            style = Paint.Style.FILL
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val side = w * 0.34f
+            val left = (w - side) / 2f
+            val top = (h - side) / 2f
+            val r = w * 0.055f
+            canvas.drawRoundRect(RectF(left, top, left + side, top + side), r, r, paint)
         }
     }
 
