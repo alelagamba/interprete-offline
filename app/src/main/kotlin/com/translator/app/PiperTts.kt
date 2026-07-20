@@ -5,9 +5,11 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.util.Log
+import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsSupertonicModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
@@ -39,13 +41,20 @@ class PiperTts(private val context: Context) {
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models"
 
         val VOICES = listOf(
-            Voice("it", "Paola", "vits-piper-it_IT-paola-medium", "it_IT-paola-medium.onnx", 67),
+            Voice("it", "Miro", "vits-piper-it_IT-miro-high", "it_IT-miro-high.onnx", 64),
             Voice("en", "Amy", "vits-piper-en_US-amy-medium", "en_US-amy-medium.onnx", 67),
             Voice("de", "Thorsten", "vits-piper-de_DE-thorsten-medium", "de_DE-thorsten-medium.onnx", 67),
         )
+
+        // Supertonic 3: modern flow-matching multilingual model (it/en/de and 28
+        // more), int8, notably more natural than Piper. Language is passed at
+        // synthesis time via GenerationConfig.extra["lang"].
+        const val SUPERTONIC_DIR = "sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
+        const val SUPERTONIC_SIZE_MB = 123
     }
 
     private val engines = mutableMapOf<String, OfflineTts>()
+    private var supertonicEngine: OfflineTts? = null
     private var audioTrack: AudioTrack? = null
     @Volatile private var stopped = false
 
@@ -63,13 +72,20 @@ class PiperTts(private val context: Context) {
     }
 
     /** Blocking download + extraction; call from a background thread. */
-    fun downloadVoice(voice: Voice, onProgress: (Int) -> Unit) {
-        val root = voicesRoot().apply { mkdirs() }
-        val archive = File(root, "${voice.dirName}.tar.bz2")
+    fun downloadVoice(voice: Voice, onProgress: (Int) -> Unit) =
+        fetchAndExtract(voice.dirName, onProgress)
 
-        val conn = URL("$BASE_URL/${voice.dirName}.tar.bz2").openConnection() as HttpURLConnection
-        conn.connectTimeout = 20_000
-        conn.readTimeout = 60_000
+    /** Blocking download + extraction of the Supertonic package. */
+    fun downloadSupertonic(onProgress: (Int) -> Unit) =
+        fetchAndExtract(SUPERTONIC_DIR, onProgress)
+
+    private fun fetchAndExtract(dirName: String, onProgress: (Int) -> Unit) {
+        val root = voicesRoot().apply { mkdirs() }
+        val archive = File(root, "$dirName.tar.bz2")
+
+        val conn = URL("$BASE_URL/$dirName.tar.bz2").openConnection() as HttpURLConnection
+        conn.connectTimeout = 30_000
+        conn.readTimeout = 180_000
         conn.instanceFollowRedirects = true
         try {
             val total = conn.contentLengthLong
@@ -107,8 +123,15 @@ class PiperTts(private val context: Context) {
             }
         }
         archive.delete()
-        Log.i(TAG, "Voice ready: ${voice.dirName}")
+        Log.i(TAG, "Package ready: $dirName")
         onProgress(100)
+    }
+
+    fun isSupertonicReady(): Boolean {
+        val dir = File(voicesRoot(), SUPERTONIC_DIR)
+        return File(dir, "tts.json").exists() &&
+            File(dir, "vocoder.int8.onnx").exists() &&
+            File(dir, "text_encoder.int8.onnx").exists()
     }
 
     /** Loads (or returns the cached) engine; blocking, call off the main thread. */
@@ -130,17 +153,66 @@ class PiperTts(private val context: Context) {
         return tts
     }
 
+    private fun supertonic(): OfflineTts {
+        supertonicEngine?.let { return it }
+        val dir = File(voicesRoot(), SUPERTONIC_DIR)
+        val config = OfflineTtsConfig(
+            model = OfflineTtsModelConfig(
+                supertonic = OfflineTtsSupertonicModelConfig(
+                    durationPredictor = File(dir, "duration_predictor.int8.onnx").absolutePath,
+                    textEncoder = File(dir, "text_encoder.int8.onnx").absolutePath,
+                    vectorEstimator = File(dir, "vector_estimator.int8.onnx").absolutePath,
+                    vocoder = File(dir, "vocoder.int8.onnx").absolutePath,
+                    ttsJson = File(dir, "tts.json").absolutePath,
+                    unicodeIndexer = File(dir, "unicode_indexer.bin").absolutePath,
+                    voiceStyle = File(dir, "voice.bin").absolutePath,
+                ),
+                numThreads = 2,
+            ),
+        )
+        val tts = OfflineTts(config = config)
+        supertonicEngine = tts
+        return tts
+    }
+
+    /**
+     * Supertonic synthesis. The language MUST be passed via extra["lang"],
+     * otherwise the model defaults to English. Blocking; call off the main thread.
+     */
+    fun speakSupertonic(text: String, langCode: String, speed: Float = 1.0f): Boolean {
+        if (!isSupertonicReady()) return false
+        return try {
+            stopped = false
+            val tts = supertonic()
+            val audio = tts.generateWithConfig(
+                text,
+                GenerationConfig(
+                    speed = speed,
+                    sid = 0,
+                    numSteps = 5,
+                    extra = mapOf("lang" to langCode),
+                ),
+            )
+            if (audio.samples.isEmpty() || stopped) return false
+            play(audio.samples, audio.sampleRate)
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "Supertonic synthesis failed", e)
+            false
+        }
+    }
+
     /**
      * Synthesizes and plays [text]; blocking until playback finishes.
      * Returns false when the voice is missing or synthesis fails.
      */
-    fun speak(text: String, langCode: String): Boolean {
+    fun speak(text: String, langCode: String, speed: Float = 1.0f): Boolean {
         val voice = voiceFor(langCode) ?: return false
         if (!isVoiceReady(langCode)) return false
         return try {
             stopped = false
             val tts = engineFor(voice)
-            val audio = tts.generate(text = text, sid = 0, speed = 1.0f)
+            val audio = tts.generate(text = text, sid = 0, speed = speed)
             if (audio.samples.isEmpty() || stopped) return false
             play(audio.samples, audio.sampleRate)
             true
@@ -214,5 +286,7 @@ class PiperTts(private val context: Context) {
         stop()
         engines.values.forEach { runCatching { it.release() } }
         engines.clear()
+        supertonicEngine?.let { runCatching { it.release() } }
+        supertonicEngine = null
     }
 }

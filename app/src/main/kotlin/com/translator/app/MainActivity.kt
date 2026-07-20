@@ -16,13 +16,18 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.util.Log
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -70,6 +75,8 @@ import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -124,12 +131,20 @@ class MainActivity : ComponentActivity() {
     private var extraLanguagesEnabled = false
     private var textScale = 1.0f
     private var simultaneousMode = false
+    private var themeMode = "system"   // "system" | "light" | "dark"
     private var selectedSourceIndex = 1
     private var selectedTargetIndex = 0
     private var speechModelDir: String? = null
     private var liveTranslateSerial = 0
     private var lastLiveTranslationRequest = ""
     private var lastLiveTranslationAt = 0L
+
+    // Live simultaneous mode: a scrolling transcript of committed (finalized)
+    // translations plus the current tentative line.
+    private val liveCommitted = StringBuilder()
+    private var livePending = ""
+    private var lastFinalSource = ""
+    private lateinit var liveScroll: ScrollView
 
     private val translators = mutableMapOf<TranslationKey, Translator>()
     private val readyTranslationKeys = mutableSetOf<TranslationKey>()
@@ -144,6 +159,10 @@ class MainActivity : ComponentActivity() {
         }
     private var continuousMode = true
     private var usePiper = true
+    private var naturalVoice = false
+    private var liveVoiceEnabled = false
+    private var liveVoiceChannel: Channel<Pair<String, String>>? = null
+    private var liveVoiceJob: Job? = null
     private val history = mutableListOf<Exchange>()
     private val downloadingVoices = mutableSetOf<String>()
 
@@ -174,9 +193,12 @@ class MainActivity : ComponentActivity() {
         private const val PREF_TTS_ENABLED = "tts-enabled"
         private const val PREF_CONTINUOUS = "continuous-mode"
         private const val PREF_USE_PIPER = "use-piper"
+        private const val PREF_NATURAL_VOICE = "natural-voice"
+        private const val PREF_LIVE_VOICE = "live-voice"
         private const val PREF_EXTRA_LANGUAGES = "extra-languages"
         private const val PREF_TEXT_SCALE = "text-scale"
         private const val PREF_SIMULTANEOUS_MODE = "simultaneous-mode"
+        private const val PREF_THEME = "theme-mode"
         private const val MIC_PERMISSION = 1
 
         private val STT_MODEL = SttModel.PARAKEET
@@ -211,18 +233,22 @@ class MainActivity : ComponentActivity() {
             LanguageOption("Ucraino", "ucraino", TranslateLanguage.UKRAINIAN, "uk", "🇺🇦"),
         )
 
-        // Light palette, reference-style
-        private const val BG = "#E8EAEE"
-        private const val CARD = "#FBFCFD"
-        private const val PILL = "#EDEFF3"
-        private const val TEXT_PRIMARY = "#17191C"
-        private const val TEXT_SECONDARY = "#8A93A1"
-        private const val ICON = "#3C434D"
-        private const val BLACK_BTN = "#15181C"
+        // Live "teleprompter" palette (dark, high-contrast for subtitle reading)
+        private const val LIVE_BG = "#0B0E13"
+        private const val LIVE_SURFACE = "#161C24"
+        private const val LIVE_TEXT = "#F2F5F9"
+        private const val LIVE_DIM = "#7A8698"
+
+        // Accent colors (theme-independent)
         private const val ACCENT = "#FF5A4E"
         private const val GREEN = "#12A667"
         private const val AMBER = "#C98A0B"
         private const val RED = "#DC4B41"
+
+        // Set per build so the custom-drawn views follow the active theme.
+        private var uiIconColor = "#3C434D"
+        private var uiSurfaceColor = "#FBFCFD"
+        private var uiMicIdleColor = "#15181C"
 
         private const val SRC_PLACEHOLDER = "Parla al microfono\no tocca qui per scrivere."
         private const val TGT_PLACEHOLDER = "La traduzione apparirà qui."
@@ -234,15 +260,44 @@ class MainActivity : ComponentActivity() {
     private fun dpF(value: Float): Float =
         value * resources.displayMetrics.density
 
+    private val appDark: Boolean
+        get() = when (themeMode) {
+            "dark" -> true
+            "light" -> false
+            else -> (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+        }
+
+    // Theme-aware palette (the live teleprompter keeps its own dark LIVE_* set).
+    private val BG get() = if (appDark) "#0F1216" else "#E8EAEE"
+    private val CARD get() = if (appDark) "#1B212B" else "#FBFCFD"
+    private val PILL get() = if (appDark) "#272F3B" else "#EDEFF3"
+    private val TEXT_PRIMARY get() = if (appDark) "#F2F5F9" else "#17191C"
+    private val TEXT_SECONDARY get() = if (appDark) "#9AA4B2" else "#8A93A1"
+    private val BLACK_BTN get() = if (appDark) "#333C49" else "#15181C"
+    private val DIVIDER get() = if (appDark) "#2A313C" else "#E3E6EB"
+
+    private fun mainTextSize(isSource: Boolean): Float {
+        val base = when {
+            simultaneousMode && isSource -> 15f   // live: current-hearing line
+            simultaneousMode -> 27f               // live: translated transcript
+            else -> 23f
+        }
+        return base * textScale
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         ttsEnabled = prefs.getBoolean(PREF_TTS_ENABLED, true)
         continuousMode = prefs.getBoolean(PREF_CONTINUOUS, true)
         usePiper = prefs.getBoolean(PREF_USE_PIPER, true)
+        naturalVoice = prefs.getBoolean(PREF_NATURAL_VOICE, false)
+        liveVoiceEnabled = prefs.getBoolean(PREF_LIVE_VOICE, false)
         extraLanguagesEnabled = prefs.getBoolean(PREF_EXTRA_LANGUAGES, false)
         textScale = prefs.getFloat(PREF_TEXT_SCALE, 1.0f).coerceIn(0.9f, 1.25f)
         simultaneousMode = prefs.getBoolean(PREF_SIMULTANEOUS_MODE, false)
+        themeMode = prefs.getString(PREF_THEME, "system") ?: "system"
         languageIdentifier = LanguageIdentification.getClient()
         piperTts = PiperTts(applicationContext)
         buildUI()
@@ -250,6 +305,7 @@ class MainActivity : ComponentActivity() {
         ensureTranslationModelsForSelection()
         loadSpeechPipeline()
         ensureVoicesForSelection()
+        if (naturalVoice) ensureSupertonic()
 
         onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -262,6 +318,29 @@ class MainActivity : ComponentActivity() {
                 }
             }
         })
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (!::sourceText.isInitialized || !::targetText.isInitialized) return
+
+        val sourceSnapshot = sourceText.text.toString()
+        val targetSnapshot = targetText.text.toString()
+        val targetColor = targetText.currentTextColor
+        val statusSnapshot = if (::statusView.isInitialized) statusView.text.toString() else ""
+        val settingsVisible = ::settingsPanel.isInitialized && settingsPanel.visibility == View.VISIBLE
+
+        buildUI()
+        if (simultaneousMode) {
+            renderLiveTranscript()
+        } else {
+            sourceText.setText(sourceSnapshot)
+            targetText.text = targetSnapshot
+            targetText.setTextColor(targetColor)
+        }
+        if (statusSnapshot.isNotBlank()) setStatus(statusSnapshot)
+        if (settingsVisible) showSettings()
+        updateButtonStates()
     }
 
     override fun onStop() {
@@ -361,7 +440,15 @@ class MainActivity : ComponentActivity() {
 
     private fun buildUI() {
         WindowCompat.getInsetsController(window, window.decorView)
-            .isAppearanceLightStatusBars = true
+            .isAppearanceLightStatusBars = !simultaneousMode && !appDark
+        if (simultaneousMode) {
+            buildLiveUI()
+            return
+        }
+
+        uiIconColor = if (appDark) "#D4DAE2" else "#3C434D"
+        uiSurfaceColor = CARD
+        uiMicIdleColor = BLACK_BTN
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -389,14 +476,17 @@ class MainActivity : ComponentActivity() {
             insets
         }
 
-        root.addView(header())
-
-        val cardsHorizontal = simultaneousMode &&
-            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val compactLive = false
+        if (!compactLive) root.addView(header())
 
         val cards = LinearLayout(this).apply {
-            orientation = if (cardsHorizontal) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
-            setPadding(dp(18), dp(6), dp(18), dp(4))
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                if (compactLive) dp(10) else dp(18),
+                if (compactLive) dp(0) else dp(6),
+                if (compactLive) dp(10) else dp(18),
+                if (compactLive) dp(0) else dp(4),
+            )
             clipChildren = false
             clipToPadding = false
             layoutParams = LinearLayout.LayoutParams(
@@ -407,29 +497,40 @@ class MainActivity : ComponentActivity() {
         }
 
         val source = translationCard(isSource = true)
+        if (compactLive) {
+            source.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(54),
+            )
+        }
         cards.addView(source)
 
         swapButton = TextView(this).apply {
             text = "⇅"
-            textSize = 22f
+            textSize = if (compactLive) 18f else 22f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             background = roundedColor(BLACK_BTN, dpF(28f))
             elevation = dpF(8f)
-            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply {
-                gravity = if (cardsHorizontal) Gravity.CENTER_VERTICAL else Gravity.CENTER_HORIZONTAL
-                if (cardsHorizontal) {
-                    setMargins(dp(-16), 0, dp(-16), 0)
-                } else {
-                    setMargins(0, dp(-24), 0, dp(-24))
-                }
+            val size = if (compactLive) dp(46) else dp(56)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                setMargins(0, if (compactLive) dp(-18) else dp(-24), 0, if (compactLive) dp(-18) else dp(-24))
             }
+            visibility = if (compactLive) View.GONE else View.VISIBLE
             setOnClickListener { swapLanguages() }
         }
         cards.addView(swapButton)
 
         val target = translationCard(isSource = false)
+        if (compactLive) {
+            target.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            )
+        }
         cards.addView(target)
 
         root.addView(cards)
@@ -437,7 +538,15 @@ class MainActivity : ComponentActivity() {
 
         val rootFrame = FrameLayout(this)
         rootFrame.addView(root)
+        attachSettingsOverlay(rootFrame)
 
+        setContentView(rootFrame)
+        updateLanguageUi()
+        updateModeButton()
+        updateButtonStates()
+    }
+
+    private fun attachSettingsOverlay(rootFrame: FrameLayout) {
         settingsPanel = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor(BG))
             isVerticalScrollBarEnabled = false
@@ -457,12 +566,308 @@ class MainActivity : ComponentActivity() {
             v.setPadding(v.paddingLeft, sb.top, v.paddingRight, sb.bottom)
             insets
         }
+    }
+
+    // ---------------------------------------------------- live teleprompter
+
+    /**
+     * Full-screen dark teleprompter for simultaneous mode: a scrolling
+     * transcript of finalized translations with the tentative current line
+     * dimmed underneath, a thin "now hearing" line, and a big mic. Works in
+     * portrait (the tour-guide hold) as well as landscape.
+     */
+    private fun buildLiveUI() {
+        // The teleprompter is always dark; make its custom views read light glyphs.
+        uiIconColor = LIVE_TEXT
+        uiSurfaceColor = LIVE_SURFACE
+        uiMicIdleColor = "#2C333D"
+
+        // Controls the shared logic touches but the teleprompter doesn't show.
+        keyboardButton = FrameLayout(this)
+        cameraButton = FrameLayout(this)
+        clearButton = FrameLayout(this)
+        swapButton = TextView(this)
+        modeButton = TextView(this)
+
+        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor(LIVE_BG))
+            isFocusable = true
+            isFocusableInTouchMode = true
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(
+                bars.left + dp(16),
+                bars.top + dp(8),
+                bars.right + dp(16),
+                bars.bottom + dp(if (landscape) 6 else 10),
+            )
+            insets
+        }
+
+        // --- shared views (assembled differently per orientation) ---
+        val turniButton = TextView(this).apply {
+            text = "⤢  Turni"
+            textSize = 13f
+            setTextColor(Color.parseColor(LIVE_TEXT))
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            background = roundedColor(LIVE_SURFACE, dpF(18f))
+            setPadding(dp(13), dp(9), dp(13), dp(9))
+            setOnClickListener { if (!conversationActive) setSimultaneousMode(false) }
+        }
+        val src = livePill { showLanguagePicker(isSource = true) }
+        sourcePill = src.first; sourceFlag = src.second; sourceValue = src.third
+        val arrow = {
+            TextView(this).apply {
+                text = "→"
+                textSize = 15f
+                setTextColor(Color.parseColor(LIVE_DIM))
+                setPadding(dp(8), 0, dp(8), 0)
+            }
+        }
+        val tgt = livePill { showLanguagePicker(isSource = false) }
+        targetPill = tgt.first; targetFlag = tgt.second; targetValue = tgt.third
+
+        liveScroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            isFillViewport = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            )
+        }
+        targetText = TextView(this).apply {
+            text = ""
+            textSize = mainTextSize(isSource = false)
+            setTextColor(Color.parseColor(LIVE_TEXT))
+            typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            setLineSpacing(dpF(6f), 1.14f)
+            gravity = Gravity.TOP or Gravity.START
+            setPadding(dp(4), dp(8), dp(4), dp(30))
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+            )
+        }
+        liveScroll.addView(targetText)
+
+        sourceText = EditText(this).apply {
+            setText("")
+            hint = "In ascolto..."
+            setHintTextColor(Color.parseColor(LIVE_DIM))
+            setTextColor(Color.parseColor(LIVE_DIM))
+            textSize = mainTextSize(isSource = true)
+            background = null
+            isFocusable = false
+            isFocusableInTouchMode = false
+            isCursorVisible = false
+            keyListener = null
+            maxLines = if (landscape) 1 else 2
+            setPadding(dp(4), dp(2), dp(4), dp(4))
+        }
+
+        waveform = LiveWaveformView(this)
+
+        statusDot = View(this).apply {
+            background = roundedColor(GREEN, dpF(4f))
+            layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply {
+                setMargins(0, 0, dp(8), 0)
+            }
+        }
+        statusView = TextView(this).apply {
+            text = "Preparazione..."
+            textSize = 13f
+            setTextColor(Color.parseColor(GREEN))
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        }
+        downloadProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(dp(200), dp(4)).apply {
+                setMargins(0, 0, 0, dp(6))
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        }
+        micButton = MicButtonView(this).apply {
+            elevation = dpF(6f)
+            setOnClickListener { onMicTap() }
+        }
+
+        if (landscape) {
+            // Compact single top row: Turni | pills | spacer | history/settings
+            val topBar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(6))
+            }
+            topBar.addView(turniButton)
+            topBar.addView(View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(12), dp(1))
+            })
+            topBar.addView(sourcePill)
+            topBar.addView(arrow())
+            topBar.addView(targetPill)
+            topBar.addView(View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(0, dp(1), 1f)
+            })
+            topBar.addView(liveIconButton("🕘") { showHistory() })
+            topBar.addView(liveIconButton("⚙") { showSettings() })
+            root.addView(topBar)
+
+            root.addView(liveScroll)
+
+            // Bottom row: hearing line + status on the left, small waveform,
+            // mic parked bottom-right (as requested).
+            val bottomBar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(6), 0, 0)
+            }
+            val leftCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            leftCol.addView(sourceText)
+            leftCol.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(2), 0, 0)
+                addView(statusDot)
+                addView(statusView)
+            })
+            leftCol.addView(downloadProgress)
+            bottomBar.addView(leftCol)
+
+            waveform.layoutParams = LinearLayout.LayoutParams(dp(96), dp(22)).apply {
+                setMargins(dp(10), 0, dp(12), 0)
+            }
+            bottomBar.addView(waveform)
+
+            micButton.layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+            bottomBar.addView(micButton)
+
+            root.addView(bottomBar)
+        } else {
+            // Portrait teleprompter: stacked, mic centered at the bottom.
+            val topBar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(10))
+            }
+            topBar.addView(turniButton)
+            topBar.addView(View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(0, dp(1), 1f)
+            })
+            topBar.addView(TextView(this).apply {
+                text = "Live"
+                textSize = 12f
+                setTextColor(Color.parseColor(LIVE_DIM))
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setPadding(dp(6), 0, dp(6), 0)
+            })
+            topBar.addView(liveIconButton("🕘") { showHistory() })
+            topBar.addView(liveIconButton("⚙") { showSettings() })
+            root.addView(topBar)
+
+            val langRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(8))
+            }
+            langRow.addView(sourcePill)
+            langRow.addView(arrow())
+            langRow.addView(targetPill)
+            root.addView(langRow)
+
+            root.addView(liveScroll)
+
+            root.addView(View(this).apply {
+                setBackgroundColor(Color.parseColor(LIVE_SURFACE))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(1),
+                ).apply { setMargins(0, dp(4), 0, dp(8)) }
+            })
+            root.addView(sourceText)
+
+            waveform.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(26),
+            ).apply { setMargins(dp(8), dp(4), dp(8), dp(4)) }
+            root.addView(waveform)
+
+            root.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(8))
+                addView(statusDot)
+                addView(statusView)
+            })
+            root.addView(downloadProgress)
+
+            root.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(4))
+                micButton.layoutParams = LinearLayout.LayoutParams(dp(66), dp(66))
+                addView(micButton)
+            })
+        }
+
+        val rootFrame = FrameLayout(this)
+        rootFrame.addView(root)
+        attachSettingsOverlay(rootFrame)
 
         setContentView(rootFrame)
+        renderLiveTranscript()
         updateLanguageUi()
-        updateModeButton()
         updateButtonStates()
     }
+
+    private fun livePill(onClick: () -> Unit): Triple<LinearLayout, FlagView, TextView> {
+        val flag = FlagView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
+                setMargins(0, 0, dp(7), 0)
+            }
+        }
+        val value = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.parseColor(LIVE_TEXT))
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        }
+        val pill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundedColor(LIVE_SURFACE, dpF(18f))
+            setPadding(dp(11), dp(8), dp(12), dp(8))
+            setOnClickListener { onClick() }
+            addView(flag)
+            addView(value)
+            addView(TextView(this@MainActivity).apply {
+                text = "⌄"
+                textSize = 12f
+                setTextColor(Color.parseColor(LIVE_DIM))
+                setPadding(dp(5), 0, 0, dp(3))
+            })
+        }
+        return Triple(pill, flag, value)
+    }
+
+    private fun liveIconButton(glyph: String, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            text = glyph
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor(LIVE_TEXT))
+            background = roundedColor(LIVE_SURFACE, dpF(18f))
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38)).apply {
+                setMargins(dp(8), 0, 0, 0)
+            }
+            setOnClickListener { onClick() }
+        }
 
     // -------------------------------------------------------- settings page
 
@@ -504,11 +909,99 @@ class MainActivity : ComponentActivity() {
         })
         settingsContent.addView(headerRow)
 
-        // ------------------------------------------------------- language card
+        // 1 ─────────────────────────────────────────────── conversazione
+        val convCard = settingsCard("Conversazione")
+        convCard.addView(switchRow(
+            "Modalità simultanea",
+            "Sottotitoli in tempo reale mentre l'altra persona parla, senza voce.",
+            simultaneousMode,
+        ) { checked ->
+            setSimultaneousMode(checked)
+            rebuildSettings()
+        })
+        convCard.addView(settingsDivider())
+        convCard.addView(switchRow(
+            "Ascolto continuo",
+            "Dopo ogni frase torna in ascolto da sola. Se spento, premi il microfono ogni volta.",
+            continuousMode,
+        ) { checked ->
+            continuousMode = checked
+            savePref(PREF_CONTINUOUS, checked)
+        })
+        settingsContent.addView(convCard)
+
+        // 2 ───────────────────────────────────────────────────── voce
+        val voiceCard = settingsCard("Voce")
+        voiceCard.addView(switchRow(
+            "Leggi la traduzione",
+            "Pronuncia ogni traduzione ad alta voce appena pronta.",
+            ttsEnabled,
+        ) { checked -> setTtsEnabled(checked) }.also { it.alpha = 1f })
+
+        if (ttsEnabled) {
+            voiceCard.addView(settingsDivider())
+            voiceCard.addView(sectionLabel("Motore voce"))
+            voiceCard.addView(engineRow(
+                "Naturale (consigliata)",
+                "Voce neurale più espressiva. ~123 MB da scaricare una volta.",
+                selected = currentVoiceEngine() == "supertonic",
+            ) { setVoiceEngine("supertonic") })
+            voiceCard.addView(engineRow(
+                "In-app leggera",
+                "Voce neurale più leggera, offline dopo il download.",
+                selected = currentVoiceEngine() == "piper",
+            ) { setVoiceEngine("piper") })
+            voiceCard.addView(engineRow(
+                "Voce del telefono",
+                "Usa le voci di sistema Android (variano per telefono).",
+                selected = currentVoiceEngine() == "system",
+            ) { setVoiceEngine("system") })
+
+            voiceCard.addView(settingsDivider())
+            voiceCard.addView(switchRow(
+                "Voce simultanea in cuffia",
+                "In modalità simultanea legge in cuffia ogni frase, in ordine. Richiede cuffie.",
+                liveVoiceEnabled,
+            ) { checked ->
+                liveVoiceEnabled = checked
+                savePref(PREF_LIVE_VOICE, checked)
+                if (!checked) stopLiveVoice()
+                else if (conversationActive && simultaneousMode) startLiveVoice()
+            })
+        }
+        settingsContent.addView(voiceCard)
+
+        // 3 ─────────────────────────────────────── download voci (contestuale)
+        if (ttsEnabled) settingsContent.addView(voiceDownloadCard())
+
+        // 4 ───────────────────────────────────────────────────── aspetto
+        val themeCard = settingsCard("Aspetto")
+        themeCard.addView(sectionLabel("Tema"))
+        val themeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        listOf("Sistema" to "system", "Chiaro" to "light", "Scuro" to "dark").forEach { (label, mode) ->
+            themeRow.addView(themeButton(label, mode))
+        }
+        themeCard.addView(themeRow)
+        themeCard.addView(settingsDivider())
+        themeCard.addView(sectionLabel("Dimensione testo"))
+        val scaleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        listOf("Piccolo" to 0.9f, "Normale" to 1.0f, "Grande" to 1.18f).forEach { (label, scale) ->
+            scaleRow.addView(textScaleButton(label, scale))
+        }
+        themeCard.addView(scaleRow)
+        settingsContent.addView(themeCard)
+
+        // 5 ─────────────────────────────────────────── lingue (avanzate)
         val languageCard = settingsCard("Lingue")
         languageCard.addView(switchRow(
-            "Lingue extra beta",
-            "Mostra altre lingue compatibili con ML Kit e con la copertura ampia di Parakeet TDT. I modelli di traduzione si scaricano solo per la coppia scelta.",
+            "Più lingue (beta)",
+            "Aggiunge 22 lingue europee oltre a italiano, inglese e tedesco. Voce naturale garantita solo per le tre principali.",
             extraLanguagesEnabled,
         ) { checked ->
             extraLanguagesEnabled = checked
@@ -519,127 +1012,76 @@ class MainActivity : ComponentActivity() {
             ensureVoicesForSelection()
             rebuildSettings()
         })
-        languageCard.addView(TextView(this).apply {
-            text = if (extraLanguagesEnabled) {
-                "${availableLanguages().size} lingue visibili. Voce neurale locale disponibile per italiano, inglese e tedesco; per le altre lingue si usa la voce Android se installata."
-            } else {
-                "Modalità stabile: italiano, inglese e tedesco."
-            }
-            textSize = 12f
-            setTextColor(Color.parseColor(TEXT_SECONDARY))
-            setPadding(0, dp(10), 0, 0)
-            setLineSpacing(dpF(3f), 1f)
-        })
         settingsContent.addView(languageCard)
+    }
 
-        // ------------------------------------------------ conversation card
-        val convCard = settingsCard("Conversazione")
-        convCard.addView(switchRow(
-            "Simultanea beta",
-            "Mostra testo e traduzione mentre continui a parlare. Usa la direzione selezionata e non legge ad alta voce.",
-            simultaneousMode,
-        ) { checked ->
-            setSimultaneousMode(checked)
-            rebuildSettings()
-        })
-        convCard.addView(settingsDivider())
-        convCard.addView(switchRow(
-            "Conversazione continua",
-            "Dopo ogni frase l'app torna in ascolto da sola. Se disattivata, premi il microfono per ogni frase.",
-            continuousMode,
-        ) { checked ->
-            continuousMode = checked
-            savePref(PREF_CONTINUOUS, checked)
-        })
-        settingsContent.addView(convCard)
-
-        // ---------------------------------------------------------- text card
-        val textCard = settingsCard("Testo")
-        textCard.addView(TextView(this).apply {
-            text = "Dimensione testo traduzioni"
-            textSize = 15f
+    private fun sectionLabel(text: String): TextView =
+        TextView(this).apply {
+            this.text = text
+            textSize = 14f
             setTextColor(Color.parseColor(TEXT_PRIMARY))
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        })
-        textCard.addView(TextView(this).apply {
-            text = "Regola solo i testi principali: originale e traduzione."
-            textSize = 12f
-            setTextColor(Color.parseColor(TEXT_SECONDARY))
-            setPadding(0, dp(4), 0, dp(12))
-        })
-        val scaleRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(10))
         }
-        listOf(
-            "Piccolo" to 0.9f,
-            "Normale" to 1.0f,
-            "Grande" to 1.18f,
-        ).forEach { (label, scale) ->
-            scaleRow.addView(textScaleButton(label, scale))
+
+    private fun currentVoiceEngine(): String = when {
+        !usePiper -> "system"
+        naturalVoice -> "supertonic"
+        else -> "piper"
+    }
+
+    private fun setVoiceEngine(engine: String) {
+        when (engine) {
+            "supertonic" -> { usePiper = true; naturalVoice = true }
+            "piper" -> { usePiper = true; naturalVoice = false }
+            else -> usePiper = false
         }
-        textCard.addView(scaleRow)
-        settingsContent.addView(textCard)
+        savePref(PREF_USE_PIPER, usePiper)
+        savePref(PREF_NATURAL_VOICE, naturalVoice)
+        if (naturalVoice) ensureSupertonic()
+        if (usePiper) ensureVoicesForSelection()
+        rebuildSettings()
+    }
 
-        // ------------------------------------------------------- voice card
-        val voiceCard = settingsCard("Voce")
-        voiceCard.addView(switchRow(
-            "Leggi traduzione ad alta voce",
-            "L'interprete pronuncia ogni traduzione appena pronta.",
-            ttsEnabled,
-        ) { checked ->
-            setTtsEnabled(checked)
-        })
-
-        voiceCard.addView(settingsDivider())
-        voiceCard.addView(engineRow(
-            "Voce neurale in-app (consigliata)",
-            "Qualità alta, sempre offline dopo il download delle voci.",
-            selected = usePiper,
-        ) {
-            usePiper = true
-            savePref(PREF_USE_PIPER, true)
-            ensureVoicesForSelection()
-            rebuildSettings()
-        })
-        voiceCard.addView(engineRow(
-            "Voce di sistema Android",
-            "Usa le voci del telefono (dipende da quelle installate).",
-            selected = !usePiper,
-        ) {
-            usePiper = false
-            savePref(PREF_USE_PIPER, false)
-            rebuildSettings()
-        })
-        settingsContent.addView(voiceCard)
-
-        if (usePiper) {
-            val voicesCard = settingsCard("Voci neurali (Piper)")
+    /** Contextual download UI for the currently selected voice engine. */
+    private fun voiceDownloadCard(): LinearLayout = when (currentVoiceEngine()) {
+        "supertonic" -> settingsCard("Voce naturale").apply {
+            val ready = piperTts?.isSupertonicReady() == true
+            val downloading = downloadingVoices.contains("supertonic")
+            addView(TextView(this@MainActivity).apply {
+                text = when {
+                    ready -> "✓ Voce naturale pronta e offline."
+                    downloading -> "Download in corso..."
+                    else -> "Verrà scaricata al primo utilizzo (~123 MB, Wi-Fi consigliato)."
+                }
+                textSize = 14f
+                setTextColor(Color.parseColor(if (ready) GREEN else TEXT_PRIMARY))
+            })
+        }
+        "piper" -> settingsCard("Voci in-app").apply {
             PiperTts.VOICES.forEach { voice ->
                 val language = CORE_LANGUAGES.firstOrNull { it.ttsCode == voice.langCode } ?: return@forEach
-                voicesCard.addView(piperVoiceRow(language, voice))
+                addView(piperVoiceRow(language, voice))
             }
-            voicesCard.addView(TextView(this).apply {
-                text = "Le voci si scaricano una sola volta (Wi-Fi consigliato) e poi funzionano completamente offline."
+            addView(TextView(this@MainActivity).apply {
+                text = "Si scaricano una volta e poi funzionano offline."
                 textSize = 12f
                 setTextColor(Color.parseColor(TEXT_SECONDARY))
                 setPadding(0, dp(10), 0, 0)
             })
-            settingsContent.addView(voicesCard)
-        } else {
-            val androidCard = settingsCard("Voci di sistema")
-            val voicesStatus = availableLanguages().joinToString("\n") { lang ->
-                val availability = systemTts?.isLanguageAvailable(localeFor(lang))
-                val ok = systemTtsReady && availability != null && availability >= TextToSpeech.LANG_AVAILABLE
-                "${lang.flag} ${lang.name}: ${if (ok) "voce pronta" else "voce mancante"}"
-            }
-            androidCard.addView(TextView(this).apply {
-                text = voicesStatus
+        }
+        else -> settingsCard("Voci del telefono").apply {
+            addView(TextView(this@MainActivity).apply {
+                text = availableLanguages().joinToString("\n") { lang ->
+                    val availability = systemTts?.isLanguageAvailable(localeFor(lang))
+                    val ok = systemTtsReady && availability != null && availability >= TextToSpeech.LANG_AVAILABLE
+                    "${lang.flag} ${lang.name}: ${if (ok) "pronta" else "mancante"}"
+                }
                 textSize = 14f
                 setTextColor(Color.parseColor(TEXT_PRIMARY))
                 setLineSpacing(dpF(5f), 1f)
             })
-            androidCard.addView(TextView(this).apply {
+            addView(TextView(this@MainActivity).apply {
                 text = "Scarica voci Android"
                 textSize = 14f
                 setTextColor(Color.WHITE)
@@ -659,7 +1101,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             })
-            settingsContent.addView(androidCard)
         }
     }
 
@@ -685,7 +1126,7 @@ class MainActivity : ComponentActivity() {
 
     private fun settingsDivider(): View =
         View(this).apply {
-            setBackgroundColor(Color.parseColor("#E3E6EB"))
+            setBackgroundColor(Color.parseColor(DIVIDER))
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(1),
@@ -709,6 +1150,39 @@ class MainActivity : ComponentActivity() {
                 rebuildSettings()
             }
         }
+
+    private fun themeButton(label: String, mode: String): TextView =
+        TextView(this).apply {
+            val selected = themeMode == mode
+            text = label
+            textSize = 13f
+            gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(Color.parseColor(if (selected) "#FFFFFF" else TEXT_PRIMARY))
+            background = roundedColor(if (selected) BLACK_BTN else PILL, dpF(18f))
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(4), 0, dp(4), 0) }
+            setOnClickListener { setThemeMode(mode) }
+        }
+
+    private fun setThemeMode(mode: String) {
+        if (themeMode == mode) return
+        themeMode = mode
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_THEME, mode).apply()
+        // Rebuild the whole UI with the new palette, then reopen settings.
+        val sourceSnapshot = if (::sourceText.isInitialized) sourceText.text.toString() else ""
+        val targetSnapshot = if (::targetText.isInitialized) targetText.text.toString() else ""
+        buildUI()
+        if (!simultaneousMode) {
+            sourceText.setText(sourceSnapshot)
+            if (targetSnapshot.isNotBlank()) setCardText(targetText, targetSnapshot)
+        } else {
+            renderLiveTranscript()
+        }
+        showSettings()
+        updateButtonStates()
+    }
 
     private fun switchRow(
         title: String,
@@ -920,13 +1394,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun header(): FrameLayout {
+        val compactLive = false
         val bar = FrameLayout(this).apply {
-            setPadding(dp(18), dp(12), dp(18), dp(10))
+            setPadding(
+                dp(18),
+                if (compactLive) dp(6) else dp(12),
+                dp(18),
+                if (compactLive) dp(6) else dp(10),
+            )
         }
 
         bar.addView(TextView(this).apply {
             text = "Interprete"
-            textSize = 20f
+            textSize = if (compactLive) 18f else 20f
             setTextColor(Color.parseColor(TEXT_PRIMARY))
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             layoutParams = FrameLayout.LayoutParams(
@@ -965,20 +1445,22 @@ class MainActivity : ComponentActivity() {
         bar.addView(HistoryIconView(this).apply {
             background = roundedColor(CARD, dpF(21f))
             elevation = dpF(2f)
+            val size = if (compactLive) dp(38) else dp(42)
             layoutParams = FrameLayout.LayoutParams(
-                dp(42),
-                dp(42),
+                size,
+                size,
                 Gravity.END or Gravity.CENTER_VERTICAL,
-            ).apply { rightMargin = dp(50) }
+            ).apply { rightMargin = if (compactLive) dp(44) else dp(50) }
             setOnClickListener { showHistory() }
         })
 
         bar.addView(TuneButtonView(this).apply {
             background = roundedColor(CARD, dpF(21f))
             elevation = dpF(2f)
+            val size = if (compactLive) dp(38) else dp(42)
             layoutParams = FrameLayout.LayoutParams(
-                dp(42),
-                dp(42),
+                size,
+                size,
                 Gravity.END or Gravity.CENTER_VERTICAL,
             )
             setOnClickListener { showSettings() }
@@ -988,23 +1470,29 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun translationCard(isSource: Boolean): LinearLayout {
-        val horizontalCards = simultaneousMode &&
-            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val compactLive = false
         val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = if (compactLive && isSource) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             background = roundedColor(CARD, dpF(30f))
             elevation = dpF(4f)
-            setPadding(dp(18), dp(16), dp(18), dp(16))
-            layoutParams = if (horizontalCards) {
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
-            } else {
-                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-            }
+            setPadding(
+                if (compactLive) dp(12) else dp(18),
+                if (compactLive) dp(7) else dp(16),
+                if (compactLive) dp(12) else dp(18),
+                if (compactLive) dp(7) else dp(16),
+            )
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            if (compactLive && isSource) {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                ).apply { setMargins(0, 0, dp(10), 0) }
+            }
         }
 
         if (isSource) {
@@ -1013,7 +1501,7 @@ class MainActivity : ComponentActivity() {
             sourceFlag = pill.second
             sourceValue = pill.third
             controls.addView(sourcePill)
-            controls.addView(TextView(this).apply {
+            val detectButton = TextView(this).apply {
                 text = "Rileva"
                 textSize = 13f
                 setTextColor(Color.parseColor(TEXT_SECONDARY))
@@ -1041,8 +1529,9 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-            })
-            controls.addView(spacer())
+            }
+            if (!compactLive) controls.addView(detectButton)
+            if (!compactLive) controls.addView(spacer())
             clearButton = iconCircle(ClearIconView(this)) {
                 if (!conversationActive) {
                     hideKeyboard()
@@ -1052,10 +1541,11 @@ class MainActivity : ComponentActivity() {
                     if (pipeline != null && areSelectedTranslationModelsReady()) setStatus("Pronto")
                 }
             }
-            controls.addView(clearButton)
-            controls.addView(iconCircle(SpeakerIconView(this)) {
+            if (!compactLive) controls.addView(clearButton)
+            val sourceSpeaker = iconCircle(SpeakerIconView(this)) {
                 speakIfReal(sourceText.text.toString(), SRC_PLACEHOLDER, selectedSource())
-            })
+            }
+            if (!compactLive) controls.addView(sourceSpeaker)
         } else {
             val pill = languagePill { showLanguagePicker(isSource = false) }
             targetPill = pill.first
@@ -1063,31 +1553,74 @@ class MainActivity : ComponentActivity() {
             targetValue = pill.third
             controls.addView(targetPill)
             controls.addView(spacer())
+            if (compactLive) {
+                val statusRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(10), 0, dp(10), 0)
+                }
+                statusDot = View(this).apply {
+                    background = roundedColor(GREEN, dpF(4f))
+                    layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply {
+                        setMargins(0, 0, dp(7), 0)
+                    }
+                }
+                statusRow.addView(statusDot)
+                statusView = TextView(this).apply {
+                    text = "Preparazione..."
+                    textSize = 12f
+                    setTextColor(Color.parseColor(GREEN))
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                    maxLines = 1
+                }
+                statusRow.addView(statusView)
+                controls.addView(statusRow)
+            }
             controls.addView(iconCircle(CopyIconView(this)) {
                 val text = targetText.text.toString()
                 if (text != TGT_PLACEHOLDER) copyText(text)
             })
-            controls.addView(iconCircle(SpeakerIconView(this)) {
+            if (compactLive) {
+                micButton = MicButtonView(this).apply {
+                    elevation = dpF(5f)
+                    layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply {
+                        setMargins(dp(10), 0, 0, 0)
+                    }
+                    setOnClickListener { onMicTap() }
+                }
+                controls.addView(micButton)
+            }
+            val targetSpeaker = iconCircle(SpeakerIconView(this)) {
                 speakIfReal(targetText.text.toString(), TGT_PLACEHOLDER, selectedTarget())
-            })
-            controls.addView(iconCircle(StopIconView(this)) {
+            }
+            if (!compactLive) controls.addView(targetSpeaker)
+            val stopButton = iconCircle(StopIconView(this)) {
                 stopSpeech(interruptedByUser = true)
-            })
+            }
+            if (!compactLive) controls.addView(stopButton)
         }
         card.addView(controls)
 
         val scroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
             isFillViewport = true
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f,
-            )
+            layoutParams = if (compactLive && isSource) {
+                LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    1f,
+                )
+            } else {
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    0,
+                    1f,
+                )
+            }
         }
         val textView: TextView = if (isSource) {
             EditText(this).apply {
-                hint = SRC_PLACEHOLDER
+                hint = if (compactLive) "Trascrizione live..." else SRC_PLACEHOLDER
                 setHintTextColor(Color.parseColor(TEXT_SECONDARY))
                 setTextColor(Color.parseColor(TEXT_PRIMARY))
                 background = null
@@ -1097,7 +1630,8 @@ class MainActivity : ComponentActivity() {
                 imeOptions = EditorInfo.IME_ACTION_DONE
                 setRawInputType(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
                 setHorizontallyScrolling(false)
-                maxLines = 8
+                maxLines = if (compactLive) 1 else 8
+                if (compactLive) setSingleLine(true)
                 setOnEditorActionListener { _, actionId, event ->
                     when {
                         actionId == EditorInfo.IME_ACTION_DONE -> {
@@ -1122,11 +1656,20 @@ class MainActivity : ComponentActivity() {
             }
         }
         textView.apply {
-            textSize = 23f * textScale
+            textSize = mainTextSize(isSource)
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            gravity = Gravity.CENTER
+            gravity = if (compactLive && isSource) {
+                Gravity.CENTER_VERTICAL or Gravity.START
+            } else {
+                Gravity.CENTER
+            }
             setLineSpacing(dpF(3f), 1.02f)
-            setPadding(dp(6), dp(10), dp(6), dp(10))
+            setPadding(
+                dp(6),
+                if (compactLive) dp(4) else dp(10),
+                dp(6),
+                if (compactLive) dp(4) else dp(10),
+            )
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -1190,21 +1733,33 @@ class MainActivity : ComponentActivity() {
         }
 
     private fun bottomPanel(): LinearLayout {
+        val compactLive = false
+
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(20), dp(10), dp(20), dp(14))
+            setPadding(
+                dp(20),
+                if (compactLive) dp(2) else dp(10),
+                dp(20),
+                if (compactLive) dp(6) else dp(14),
+            )
         }
 
         modeButton = TextView(this).apply {
-            textSize = 13f
+            textSize = if (compactLive) 12f else 13f
             gravity = Gravity.CENTER
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            setPadding(dp(16), dp(8), dp(16), dp(8))
+            setPadding(
+                if (compactLive) dp(14) else dp(16),
+                if (compactLive) dp(6) else dp(8),
+                if (compactLive) dp(14) else dp(16),
+                if (compactLive) dp(6) else dp(8),
+            )
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { setMargins(0, 0, 0, dp(8)) }
+            ).apply { setMargins(0, 0, 0, if (compactLive) dp(3) else dp(8)) }
             setOnClickListener {
                 if (!conversationActive) setSimultaneousMode(!simultaneousMode)
             }
@@ -1214,15 +1769,15 @@ class MainActivity : ComponentActivity() {
         waveform = LiveWaveformView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(34),
-            ).apply { setMargins(dp(8), 0, dp(8), dp(2)) }
+                if (compactLive) dp(14) else dp(34),
+            ).apply { setMargins(dp(8), 0, dp(8), if (compactLive) dp(0) else dp(2)) }
         }
         panel.addView(waveform)
 
         val statusRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, 0, 0, if (compactLive) dp(5) else dp(10))
         }
         statusDot = View(this).apply {
             background = roundedColor(GREEN, dpF(4f))
@@ -1233,7 +1788,7 @@ class MainActivity : ComponentActivity() {
         statusRow.addView(statusDot)
         statusView = TextView(this).apply {
             text = "Preparazione..."
-            textSize = 14f
+            textSize = if (compactLive) 12f else 14f
             setTextColor(Color.parseColor(GREEN))
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         }
@@ -1245,7 +1800,7 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 dp(220),
                 dp(4),
-            ).apply { setMargins(0, 0, 0, dp(12)) }
+            ).apply { setMargins(0, 0, 0, if (compactLive) dp(6) else dp(12)) }
         }
         panel.addView(downloadProgress)
 
@@ -1266,12 +1821,14 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply {
                 setMargins(0, 0, dp(22), 0)
             }
+            visibility = if (compactLive) View.GONE else View.VISIBLE
         }
         actionsRow.addView(keyboardButton)
 
         micButton = MicButtonView(this).apply {
             elevation = dpF(6f)
-            layoutParams = LinearLayout.LayoutParams(dp(74), dp(74))
+            val size = if (compactLive) dp(58) else dp(74)
+            layoutParams = LinearLayout.LayoutParams(size, size)
             setOnClickListener { onMicTap() }
         }
         actionsRow.addView(micButton)
@@ -1284,6 +1841,7 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply {
                 setMargins(dp(22), 0, 0, 0)
             }
+            visibility = if (compactLive) View.GONE else View.VISIBLE
         }
         actionsRow.addView(cameraButton)
 
@@ -1430,8 +1988,8 @@ class MainActivity : ComponentActivity() {
         val target = selectedTarget()
         sourceValue.text = source.name
         targetValue.text = target.name
-        sourceFlag.setLanguage(source.ttsCode)
-        targetFlag.setLanguage(target.ttsCode)
+        sourceFlag.setLanguage(source.ttsCode, source.flag)
+        targetFlag.setLanguage(target.ttsCode, target.flag)
     }
 
     // ------------------------------------------------------------ drawables
@@ -1575,8 +2133,8 @@ class MainActivity : ComponentActivity() {
                     ttsModel = PIPELINE_TTS_MODEL,
                     precision = ModelPrecision.INT8,
                     emitPartialTranscriptions = simultaneousMode,
-                    partialTranscriptionInterval = if (simultaneousMode) 0.45f else 0.5f,
-                    endOfSpeechSilenceSec = 0.9f,
+                    partialTranscriptionInterval = if (simultaneousMode) 0.7f else 0.5f,
+                    endOfSpeechSilenceSec = if (simultaneousMode) 1.8f else 0.9f,
                 )
 
                 val p = withContext(Dispatchers.IO) {
@@ -1591,10 +2149,12 @@ class MainActivity : ComponentActivity() {
                             is SpeechEvent.SpeechEnded -> {
                                 if (simultaneousMode) setStatus("In ascolto live...") else setStatus("Sto trascrivendo...")
                             }
-                            is SpeechEvent.PartialTranscription -> handlePartialTranscription(event.text)
+                            is SpeechEvent.PartialTranscription -> {
+                                if (simultaneousMode) handleLivePartial(event.text)
+                            }
                             is SpeechEvent.TranscriptionCompleted -> {
                                 if (simultaneousMode) {
-                                    handlePartialTranscription(event.text, force = true)
+                                    handleLiveFinal(event.text)
                                 } else {
                                     handleTranscription(event.text)
                                 }
@@ -1654,7 +2214,8 @@ class MainActivity : ComponentActivity() {
         lastLiveTranslationRequest = ""
         lastLiveTranslationAt = 0L
         hideKeyboard()
-        showPlaceholders()
+        if (simultaneousMode) resetLiveTranscript() else showPlaceholders()
+        if (simultaneousMode) startLiveVoice()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         micButton.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         updateButtonStates()
@@ -1679,6 +2240,7 @@ class MainActivity : ComponentActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         micButton.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         updateButtonStates()
+        stopLiveVoice()
         systemTts?.stop()
         piperTts?.stop()
         if (pipeline != null && areSelectedTranslationModelsReady()) setStatus("Pronto")
@@ -1782,19 +2344,24 @@ class MainActivity : ComponentActivity() {
         detectDirection(text) { source, target -> runExchange(text, source, target) }
     }
 
-    private fun handlePartialTranscription(rawText: String, force: Boolean = false) {
+    /**
+     * A growing partial within the current utterance. Shows it on the "now
+     * hearing" line and translates it standalone (throttled) as the tentative
+     * pending line under the committed transcript.
+     */
+    private fun handleLivePartial(rawText: String) {
         if (!simultaneousMode || !conversationActive) return
         val text = rawText.trim().replace(Regex("\\s+"), " ")
         if (text.isBlank()) return
 
         sourceText.setText(text)
-        sourceText.setSelection(sourceText.text.length)
 
         val now = System.currentTimeMillis()
+        val words = wordCount(text)
+        if (words < 4) return
+        val grew = words >= wordCount(lastLiveTranslationRequest) + 4
         val enoughTime = now - lastLiveTranslationAt > 1200L
-        val enoughGrowth = wordCount(text) >= wordCount(lastLiveTranslationRequest) + 4
-        val sentenceBoundary = text.lastOrNull() in listOf('.', '?', '!', ':', ';')
-        if (!force && !sentenceBoundary && (!enoughTime || !enoughGrowth)) return
+        if (!grew && !enoughTime) return
         if (text == lastLiveTranslationRequest) return
 
         val source = selectedSource()
@@ -1804,20 +2371,151 @@ class MainActivity : ComponentActivity() {
         lastLiveTranslationRequest = text
         lastLiveTranslationAt = now
         val serial = ++liveTranslateSerial
-        setStatus("Traduco live...")
 
         translatorFor(source, target).translate(text)
             .addOnSuccessListener { translated ->
                 lifecycleScope.launch(Dispatchers.Main) {
                     if (!simultaneousMode || !conversationActive || serial != liveTranslateSerial) return@launch
-                    setCardText(targetText, translated)
-                    setStatus(listeningStatus())
+                    livePending = translated
+                    renderLiveTranscript()
                 }
             }
             .addOnFailureListener { e ->
-                Log.w(TAG, "Live translation failed", e)
+                Log.w(TAG, "Live partial translation failed", e)
+            }
+    }
+
+    /**
+     * The pipeline finalized an utterance (natural pause). Translate the whole
+     * complete sentence — ML Kit does far better on a full sentence than on a
+     * mid-air fragment — and append it to the transcript for good.
+     */
+    private fun handleLiveFinal(rawText: String) {
+        if (!simultaneousMode || !conversationActive) return
+        val text = tidyTranscription(rawText)
+        if (text.isBlank() || text == lastFinalSource) return
+        lastFinalSource = text
+        lastLiveTranslationRequest = ""
+        sourceText.setText(text)
+
+        val source = selectedSource()
+        val target = selectedTarget()
+        if (!isTranslationReady(source, target)) return
+        val serial = ++liveTranslateSerial
+
+        translatorFor(source, target).translate(text)
+            .addOnSuccessListener { translated ->
+                lifecycleScope.launch(Dispatchers.Main) {
+                    if (!simultaneousMode || !conversationActive) return@launch
+                    if (liveCommitted.isNotEmpty()) liveCommitted.append("\n")
+                    liveCommitted.append(translated)
+                    livePending = ""
+                    renderLiveTranscript()
+                    history.add(Exchange(source, target, text, translated))
+                    enqueueLiveVoice(translated, target)
+                }
+            }
+            .addOnFailureListener { e ->
+                Log.w(TAG, "Live final translation failed", e)
                 if (serial == liveTranslateSerial) setStatus("Errore traduzione live")
             }
+    }
+
+    private fun renderLiveTranscript() {
+        if (!::targetText.isInitialized || !::liveScroll.isInitialized) return
+        val committed = liveCommitted.toString()
+        val sb = SpannableStringBuilder(committed)
+        if (livePending.isNotBlank()) {
+            if (committed.isNotEmpty()) sb.append("\n")
+            val start = sb.length
+            sb.append(livePending)
+            sb.setSpan(
+                ForegroundColorSpan(Color.parseColor(LIVE_DIM)),
+                start,
+                sb.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        targetText.text = sb
+        liveScroll.post { liveScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun resetLiveTranscript() {
+        liveCommitted.setLength(0)
+        livePending = ""
+        lastFinalSource = ""
+        lastLiveTranslationRequest = ""
+        lastLiveTranslationAt = 0L
+        if (::targetText.isInitialized) targetText.text = ""
+        if (::sourceText.isInitialized) sourceText.setText("")
+    }
+
+    // -------------------------------------------------- live voice (headset)
+
+    private fun headphonesConnected(): Boolean {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+        }
+    }
+
+    /**
+     * Starts the FIFO voice queue for simultaneous mode. Every finalized
+     * sentence is read in order and never dropped, so the audio may fall a few
+     * seconds behind — that's accepted in exchange for completeness. Only runs
+     * with headphones, otherwise the mic would hear (and re-translate) the TTS.
+     */
+    private fun startLiveVoice() {
+        stopLiveVoice()
+        if (!liveVoiceEnabled) return
+        if (!headphonesConnected()) {
+            Toast.makeText(
+                this,
+                "Collega delle cuffie per ascoltare la traduzione simultanea.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        // Piper is blocking, so it needs a serial consumer. System TTS keeps its
+        // own FIFO queue (QUEUE_ADD), so it doesn't use this channel.
+        val channel = Channel<Pair<String, String>>(Channel.UNLIMITED)
+        liveVoiceChannel = channel
+        liveVoiceJob = lifecycleScope.launch(Dispatchers.IO) {
+            for ((text, lang) in channel) {
+                if (!conversationActive) break
+                // Normal reading speed: clarity matters more than keeping up.
+                runCatching { neuralSpeak(text, lang, 1.0f) }
+            }
+        }
+    }
+
+    private fun stopLiveVoice() {
+        liveVoiceJob?.cancel()
+        liveVoiceJob = null
+        liveVoiceChannel?.close()
+        liveVoiceChannel = null
+    }
+
+    private fun enqueueLiveVoice(text: String, target: LanguageOption) {
+        if (!liveVoiceEnabled || !conversationActive) return
+        val piper = piperTts
+        if (usePiper && piper != null && neuralVoiceReadyFor(target.ttsCode)) {
+            liveVoiceChannel?.trySend(text to target.ttsCode)
+            return
+        }
+        // System TTS fallback: its native queue keeps sentences in order.
+        val tts = systemTts ?: return
+        if (!systemTtsReady) return
+        val availability = tts.setLanguage(localeFor(target))
+        if (availability == TextToSpeech.LANG_MISSING_DATA ||
+            availability == TextToSpeech.LANG_NOT_SUPPORTED
+        ) return
+        tts.setSpeechRate(1.0f)
+        tts.speak(text, TextToSpeech.QUEUE_ADD, null, "live-${System.currentTimeMillis()}")
     }
 
     private fun wordCount(text: String): Int =
@@ -1906,10 +2604,10 @@ class MainActivity : ComponentActivity() {
         stopSpeech()
 
         val piper = piperTts
-        if (usePiper && piper != null && piper.isVoiceReady(language.ttsCode)) {
+        if (usePiper && piper != null && neuralVoiceReadyFor(language.ttsCode)) {
             setStatus("Leggo la traduzione...")
             lifecycleScope.launch(Dispatchers.IO) {
-                piper.speak(text, language.ttsCode)
+                neuralSpeak(text, language.ttsCode)
                 finishExchange()
             }
             return true
@@ -1993,8 +2691,8 @@ class MainActivity : ComponentActivity() {
     private fun speak(text: String, language: LanguageOption) {
         stopSpeech()
         val piper = piperTts
-        if (usePiper && piper != null && piper.isVoiceReady(language.ttsCode)) {
-            lifecycleScope.launch(Dispatchers.IO) { piper.speak(text, language.ttsCode) }
+        if (usePiper && piper != null && neuralVoiceReadyFor(language.ttsCode)) {
+            lifecycleScope.launch(Dispatchers.IO) { neuralSpeak(text, language.ttsCode) }
             return
         }
 
@@ -2026,6 +2724,51 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun localeFor(language: LanguageOption): Locale = Locale.forLanguageTag(language.ttsCode)
+
+    /** True if a neural voice can synthesize this language right now. */
+    private fun neuralVoiceReadyFor(langCode: String): Boolean {
+        val piper = piperTts ?: return false
+        return (naturalVoice && piper.isSupertonicReady()) || piper.isVoiceReady(langCode)
+    }
+
+    /** Blocking neural synthesis: Supertonic when enabled/ready, else Piper. */
+    private fun neuralSpeak(text: String, langCode: String, speed: Float = 1.0f): Boolean {
+        val piper = piperTts ?: return false
+        return if (naturalVoice && piper.isSupertonicReady()) {
+            piper.speakSupertonic(text, langCode, speed)
+        } else {
+            piper.speak(text, langCode, speed)
+        }
+    }
+
+    private fun ensureSupertonic() {
+        val piper = piperTts ?: return
+        if (piper.isSupertonicReady()) return
+        if (!downloadingVoices.add("supertonic")) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                piper.downloadSupertonic { p -> setStatus("Scarico voce naturale: $p%") }
+                withContext(Dispatchers.Main) {
+                    downloadingVoices.remove("supertonic")
+                    if (settingsPanel.visibility == View.VISIBLE) rebuildSettings()
+                    if (pipeline != null && areSelectedTranslationModelsReady()) setStatus("Pronto")
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "Supertonic download failed", e)
+                withContext(Dispatchers.Main) {
+                    downloadingVoices.remove("supertonic")
+                    setStatus("Voce naturale non scaricata")
+                    if (settingsPanel.visibility == View.VISIBLE) rebuildSettings()
+                }
+            }
+        }
+    }
+
+    private fun setNaturalVoice(enabled: Boolean) {
+        naturalVoice = enabled
+        savePref(PREF_NATURAL_VOICE, enabled)
+        if (enabled) ensureSupertonic()
+    }
 
     // -------------------------------------------------------------- helpers
 
@@ -2113,8 +2856,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun applyTextScale() {
-        if (::sourceText.isInitialized) sourceText.textSize = 23f * textScale
-        if (::targetText.isInitialized) targetText.textSize = 23f * textScale
+        if (::sourceText.isInitialized) sourceText.textSize = mainTextSize(isSource = true)
+        if (::targetText.isInitialized) targetText.textSize = mainTextSize(isSource = false)
     }
 
     private fun setSimultaneousMode(enabled: Boolean) {
@@ -2127,8 +2870,7 @@ class MainActivity : ComponentActivity() {
             .apply()
         stopSpeech()
         showPlaceholders()
-        updateModeButton()
-        updateButtonStates()
+        buildUI()
         speechModelDir?.let { dir ->
             initPipeline(dir)
         }
@@ -2282,7 +3024,7 @@ class MainActivity : ComponentActivity() {
                 )
             } else {
                 circlePaint.shader = null
-                circlePaint.color = Color.parseColor(if (readyState) "#15181C" else "#B9BfC9")
+                circlePaint.color = Color.parseColor(if (readyState) uiMicIdleColor else "#B9BfC9")
             }
             canvas.drawCircle(cx, cy, radius, circlePaint)
 
@@ -2354,20 +3096,30 @@ class MainActivity : ComponentActivity() {
             style = Paint.Style.STROKE
             strokeWidth = 1.5f
         }
+        private val emojiPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.CENTER
+        }
         private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
             textAlign = Paint.Align.CENTER
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
         }
         private var language = "en"
+        private var emoji = ""
 
-        fun setLanguage(code: String) {
+        fun setLanguage(code: String, flagEmoji: String = "") {
             language = code
+            emoji = flagEmoji
             invalidate()
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
+            // Custom vector flags for the core three; emoji flag for the rest.
+            if (language !in setOf("it", "de", "en") && emoji.isNotBlank()) {
+                drawEmojiFlag(canvas)
+                return
+            }
             val rect = RectF(0f, 0f, width.toFloat(), height.toFloat())
             val save = canvas.save()
             val path = Path().apply {
@@ -2382,6 +3134,12 @@ class MainActivity : ComponentActivity() {
             }
             canvas.restoreToCount(save)
             canvas.drawRoundRect(rect, height / 2f, height / 2f, stroke)
+        }
+
+        private fun drawEmojiFlag(canvas: Canvas) {
+            emojiPaint.textSize = height * 1.15f
+            val y = height / 2f - (emojiPaint.descent() + emojiPaint.ascent()) / 2f
+            canvas.drawText(emoji, width / 2f, y, emojiPaint)
         }
 
         private fun drawItaly(canvas: Canvas) {
@@ -2449,11 +3207,11 @@ class MainActivity : ComponentActivity() {
     /** Classic gear icon for the settings button. */
     private class TuneButtonView(context: android.content.Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.FILL
         }
         private val holePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#FBFCFD")
+            color = Color.parseColor(uiSurfaceColor)
             style = Paint.Style.FILL
         }
 
@@ -2480,7 +3238,7 @@ class MainActivity : ComponentActivity() {
     /** Speaker (audio) icon. */
     private class SpeakerIconView(context: android.content.Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             strokeCap = Paint.Cap.ROUND
         }
 
@@ -2513,7 +3271,7 @@ class MainActivity : ComponentActivity() {
     /** Stop playback icon. */
     private class StopIconView(context: android.content.Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.FILL
         }
 
@@ -2532,7 +3290,7 @@ class MainActivity : ComponentActivity() {
     /** History icon: clock face. */
     private class HistoryIconView(context: android.content.Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }
@@ -2555,12 +3313,12 @@ class MainActivity : ComponentActivity() {
     /** Keyboard icon: rounded frame + key dots + space bar. */
     private class KeyboardIconView(context: android.content.Context) : View(context) {
         private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }
         private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.FILL
         }
 
@@ -2589,7 +3347,7 @@ class MainActivity : ComponentActivity() {
     /** Camera icon: body + top bump + lens. */
     private class CameraIconView(context: android.content.Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }
@@ -2611,7 +3369,7 @@ class MainActivity : ComponentActivity() {
     /** X (clear) icon. */
     private class ClearIconView(context: android.content.Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }
@@ -2629,7 +3387,7 @@ class MainActivity : ComponentActivity() {
     /** Copy icon: two overlapping rounded squares. */
     private class CopyIconView(context: android.content.Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3C434D")
+            color = Color.parseColor(uiIconColor)
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }

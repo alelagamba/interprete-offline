@@ -28,7 +28,15 @@ jobs:
 
       - name: Extract version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          MAJOR="${MAJOR:-0}"
+          MINOR="${MINOR:-0}"
+          PATCH="${PATCH:-0}"
+          CODE=$((MAJOR * 1000000 + MINOR * 1000 + PATCH))
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION_CODE=$CODE" >> "$GITHUB_OUTPUT"
 
       - name: Validate project
         run: ./gradlew :app:assembleDebug
@@ -41,7 +49,7 @@ jobs:
           ./gradlew \
             :app:assembleRelease \
             -PVERSION_NAME=${{ steps.version.outputs.VERSION }} \
-            -PVERSION_CODE=${{ github.run_number }}
+            -PVERSION_CODE=${{ steps.version.outputs.VERSION_CODE }}
         env:
           SIGNING_KEYSTORE: /tmp/release.keystore
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
